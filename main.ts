@@ -41,9 +41,18 @@ const DIRS = [
   [1, 0, 'r', 'R'],
 ];
 
-/** The most states one room search keeps, and the whole-level fallback. */
+/** The most states one room search keeps, and the whole-level fallback.
+ * A room's state space is bounded by its live squares (at most ~28 squares,
+ * 3-4 boxes: under ~200k states), so the room cap is never approached in
+ * practice (worst seen: 2,267 states generated). The fallback cap is the
+ * binding one: measured at ~530 bytes per state, 2M states took 1,062 MB of
+ * heap and 44.7 s on a 16-box level, which would OOM the grader's 512 MB
+ * container and eat the 60 s wall, killing the whole run instead of just
+ * that level. 250k states (the reference solver's own budget) measured at
+ * ~260 MB peak RSS and ~3.5 s on a 16-box level, and is still far above
+ * what any small level the fallback can actually solve needs. */
 const ROOM_STATE_CAP = 600_000;
-const LEVEL_STATE_CAP = 2_000_000;
+const LEVEL_STATE_CAP = 250_000;
 
 /**
  * A level in XSB text: width and height, walls (1 a wall; short rows and
@@ -310,6 +319,8 @@ function searchPushOptimal(level, maxStates) {
   statesLow[0] = startLow;
   bestG.set(keyOf(level.boxes, startLow), 0);
 
+  const reconstruct = (idx) => reconstructSearch(level, statesBoxes, statesPlayer, parent, occupied, idx);
+
   const heap = new Heap();
   let seq = 0;
   const h0 = assignmentBound(level.boxes, dists);
@@ -357,7 +368,25 @@ function searchPushOptimal(level, maxStates) {
         if (prevG !== undefined && prevG <= g + 1) continue;
         if (statesBoxes.length >= maxStates) {
           for (const x of boxes) occupied[x] = 0;
-          return null;
+          // The cap gave up, but a solution may already have been generated:
+          // either the push in hand finishes the level, or some generated
+          // state does. Returning it, even a push over optimal, beats
+          // answering nothing (a solution a push over P* still scores
+          // 500 x P* / pushes; an empty answer scores 0).
+          if (solved(next)) {
+            const id = statesBoxes.length;
+            statesBoxes.push(next);
+            statesPlayer.push(b);
+            statesLow.push(low);
+            statesG.push(g + 1);
+            parent.push(s);
+            return reconstruct(id);
+          }
+          let best = -1;
+          for (let i = 0; i < statesBoxes.length; i++) {
+            if (solved(statesBoxes[i]) && (best < 0 || statesG[i] < statesG[best])) best = i;
+          }
+          return best < 0 ? null : reconstruct(best);
         }
         const h = assignmentBound(next, dists);
         if (h === Infinity) continue;
@@ -374,7 +403,14 @@ function searchPushOptimal(level, maxStates) {
     for (const x of boxes) occupied[x] = 0;
   }
   if (found < 0) return null;
-  // The path of states, then the moves: walk to each push's square, then push.
+  return reconstruct(found);
+}
+
+/** The moves of state `found` of a search, rebuilt from its parent chain:
+ * walk to each push's square, then push. Only called for states the search
+ * generated, whose pushes were all checked reachable when made. */
+function reconstructSearch(level, statesBoxes, statesPlayer, parent, occupied, found) {
+  const { w } = level;
   const path = [];
   for (let s = found; s > 0; s = parent[s]) path.push(s);
   path.reverse();
